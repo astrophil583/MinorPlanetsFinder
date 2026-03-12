@@ -822,11 +822,13 @@ def main():
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip interactive prompts, use config/CLI values")
     parser.add_argument("--sort", default="mag",
-                        choices=["mag", "vis", "alt", "az"],
-                        help="Sort by: mag (default), vis, alt, az")
+                        choices=["mag", "vis", "alt", "az", "speed"],
+                        help="Sort by: mag (default), vis, alt, az, speed")
     parser.add_argument("--body", default="asteroids",
                         choices=["asteroids", "comets", "both"],
                         help="Body type to search for (used with -y)")
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="Show only the top N results (after sorting)")
     args = parser.parse_args()
 
     # Config
@@ -902,9 +904,11 @@ def main():
     total_objects = len(df_ast) + len(df_com)
 
     # Compute positions for each epoch
-    best:          dict[str, dict] = {}
-    first_visible: dict[str, dict] = {}
-    epoch_counts:  dict[str, int]  = {}
+    best:          dict[str, dict]  = {}
+    first_visible: dict[str, dict]  = {}
+    epoch_counts:  dict[str, int]   = {}
+    last_pos:      dict[str, tuple] = {}   # key -> (ra_deg, dec_deg, epoch_dt)
+    velocity:      dict[str, float] = {}   # key -> arcsec/min
 
     with console.status("[cyan]Computing orbits...[/cyan]") as status:
         for i, dt in enumerate(epochs_dt):
@@ -929,6 +933,16 @@ def main():
                             "az": float(row["az"]), "el": float(row["el"]),
                             "epoch_dt": dt,
                         }
+                    new_ra, new_dec = float(row["ra"]), float(row["dec"])
+                    if key in last_pos:
+                        p_ra, p_dec, p_dt = last_pos[key]
+                        dt_min = (dt - p_dt).total_seconds() / 60.0
+                        if dt_min > 0:
+                            cos_sep = (np.sin(np.radians(p_dec)) * np.sin(np.radians(new_dec))
+                                       + np.cos(np.radians(p_dec)) * np.cos(np.radians(new_dec))
+                                       * np.cos(np.radians(new_ra - p_ra)))
+                            velocity[key] = np.degrees(np.arccos(np.clip(cos_sep, -1, 1))) * 3600.0 / dt_min
+                    last_pos[key] = (new_ra, new_dec, dt)
 
             if not df_com.empty:
                 vis = _positions_at_comets(df_com, t_jd, earth_ecl, t_ast_time,
@@ -943,10 +957,21 @@ def main():
                             "az": float(row["az"]), "el": float(row["el"]),
                             "epoch_dt": dt,
                         }
+                    new_ra, new_dec = float(row["ra"]), float(row["dec"])
+                    if key in last_pos:
+                        p_ra, p_dec, p_dt = last_pos[key]
+                        dt_min = (dt - p_dt).total_seconds() / 60.0
+                        if dt_min > 0:
+                            cos_sep = (np.sin(np.radians(p_dec)) * np.sin(np.radians(new_dec))
+                                       + np.cos(np.radians(p_dec)) * np.cos(np.radians(new_dec))
+                                       * np.cos(np.radians(new_ra - p_ra)))
+                            velocity[key] = np.degrees(np.arccos(np.clip(cos_sep, -1, 1))) * 3600.0 / dt_min
+                    last_pos[key] = (new_ra, new_dec, dt)
 
-    # Add visibility duration (hours) to each entry
+    # Add visibility duration and speed to each entry
     for key, entry in best.items():
         entry["vis_hours"] = epoch_counts.get(key, 1) * step_min / 60.0
+        entry["speed"] = velocity.get(key)   # arcsec/min, or None if seen only once
 
     if not best:
         console.print(Panel(
@@ -962,15 +987,18 @@ def main():
 
     # Sorting
     sort_key = {
-        "mag":    lambda r: r["V"],
-        "vis":    lambda r: -r["vis_hours"],   # longest first
-        "alt":    lambda r: -r["el"],           # highest first
-        "az":     lambda r: r["az"],
+        "mag":   lambda r: r["V"],
+        "vis":   lambda r: -r["vis_hours"],              # longest first
+        "alt":   lambda r: -r["el"],                     # highest first
+        "az":    lambda r: r["az"],
+        "speed": lambda r: -(r.get("speed") or 0.0),    # fastest first
     }[args.sort]
     results = sorted(best.values(), key=sort_key)
+    if args.limit and args.limit > 0:
+        results = results[:args.limit]
 
     sort_labels = {"mag": "magnitude", "vis": "visibility duration",
-                   "alt": "altitude",  "az":     "azimuth"}
+                   "alt": "altitude",  "az":  "azimuth", "speed": "speed"}
 
     n_ast = sum(1 for r in results if r.get("body_type") == "asteroid")
     n_com = sum(1 for r in results if r.get("body_type") == "comet")
@@ -1007,6 +1035,8 @@ def main():
     table.add_column("Dir.",       justify="center",   min_width=5)
     table.add_column("r (AU)",     justify="center",   min_width=7)
     table.add_column("Δ (AU)",     justify="center",   min_width=7)
+    table.add_column("″/min",      justify="center",   min_width=7,
+                     header_style="bold" if args.sort == "speed" else "")
     table.add_column("From (UTC)", justify="center",   min_width=8)
     table.add_column("Instrument", justify="center",   min_width=11)
 
@@ -1049,6 +1079,9 @@ def main():
         row_cells = [str(i)]
         if body_type == "both":
             row_cells.append("☄" if is_comet else "○")
+        spd = r.get("speed")
+        spd_str = f"{spd:.1f}" if spd is not None else "—"
+
         row_cells += [
             display,
             f"{r['V']:.1f}",
@@ -1060,6 +1093,7 @@ def main():
             _cardinal(fv_az),
             f"{float(r['r']):.3f}",
             f"{float(r['delta']):.3f}",
+            spd_str,
             fv["epoch_dt"].strftime("%H:%M"),
             _tool(r["V"]),
         ]
@@ -1070,7 +1104,8 @@ def main():
     console.print(
         f"[dim]ℹ  Asteroids: elliptic Kepler, H-G (Bowell 1989). "
         f"Comets: m=H+5·logΔ+2.5n·logr. Earth: JPL built-in ephemeris.[/dim]\n"
-        f"[dim]💡 Az/Alt shown at first-visible epoch. Use Stellarium or SkySafari to point your scope.[/dim]\n"
+        f"[dim]💡 Az/Alt and ″/min shown at first-visible epoch. "
+        f"Use [bold]--sort speed[/bold] to rank by fastest movers.[/dim]\n"
         f"[dim]🔄 To refresh catalogues: [bold]python minorplanetsfinder.py --refresh[/bold][/dim]\n"
     )
 
