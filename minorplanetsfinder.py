@@ -18,6 +18,8 @@ Usage:
     python minorplanetsfinder.py
     python minorplanetsfinder.py --date 2026-03-20 --time 22:00
     python minorplanetsfinder.py --body comets --sort vis
+    python minorplanetsfinder.py --body neocp --sort speed
+    python minorplanetsfinder.py --limit 50 --sort speed
     python minorplanetsfinder.py --config other.json
 """
 
@@ -28,6 +30,7 @@ import re
 import sys
 import warnings
 from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -59,13 +62,20 @@ except ImportError as e:
 
 console = Console()
 
-MPCORB_URL      = "https://minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz"
-COMET_URL       = "https://minorplanetcenter.net/iau/MPCORB/CometEls.txt"
-CACHE_DIR       = Path.home() / ".minorplanetsfinder"
-CACHE_FILE      = CACHE_DIR / "MPCORB.DAT.gz"
-COMET_CACHE     = CACHE_DIR / "CometEls.txt"
-MAX_CACHE_DAYS  = 7
-ECLIPTIC_OBL    = np.radians(23.43929111)   # ecliptic obliquity J2000.0
+MPCORB_URL        = "https://minorplanetcenter.net/iau/MPCORB/MPCORB.DAT.gz"
+COMET_URL         = "https://minorplanetcenter.net/iau/MPCORB/CometEls.txt"
+NEOCP_URL         = "https://www.minorplanetcenter.net/iau/NEO/neocp.txt"
+NEOSCAN_URL       = "https://newton.spacedys.com/neodys/NEOScan/index_nspl.html"
+NEODYS_PL_URL     = "https://newton.spacedys.com/neodys/priority_list/PLfile.txt"
+CACHE_DIR         = Path.home() / ".minorplanetsfinder"
+CACHE_FILE        = CACHE_DIR / "MPCORB.DAT.gz"
+COMET_CACHE       = CACHE_DIR / "CometEls.txt"
+NEOCP_CACHE       = CACHE_DIR / "neocp.txt"
+NEOSCAN_CACHE     = CACHE_DIR / "neoscan_nspl.html"
+NEODYS_PL_CACHE   = CACHE_DIR / "PLfile.txt"
+MAX_CACHE_DAYS    = 7
+NEOCP_CACHE_HOURS = 6          # NEOCP / NEOScan / NEODyS updated frequently — refresh every 6 h
+ECLIPTIC_OBL      = np.radians(23.43929111)   # ecliptic obliquity J2000.0
 
 
 # ── Download & cache ─────────────────────────────────────────────────────────────
@@ -118,6 +128,298 @@ def ensure_comets():
     r.raise_for_status()
     COMET_CACHE.write_bytes(r.content)
     console.print(f"[green]Saved: {COMET_CACHE}[/green]")
+
+
+def ensure_neocp():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if NEOCP_CACHE.exists():
+        age = datetime.now() - datetime.fromtimestamp(NEOCP_CACHE.stat().st_mtime)
+        if age.total_seconds() < NEOCP_CACHE_HOURS * 3600:
+            h, m = divmod(int(age.total_seconds()), 3600)
+            console.print(f"[dim]NEOCP cached ({h}h {m // 60}m ago).[/dim]")
+            return
+    console.print("[cyan]Downloading NEOCP from MPC...[/cyan]")
+    r = requests.get(NEOCP_URL, timeout=30)
+    r.raise_for_status()
+    NEOCP_CACHE.write_bytes(r.content)
+    console.print(f"[green]Saved: {NEOCP_CACHE}[/green]")
+
+
+def load_neocp() -> pd.DataFrame:
+    """
+    Load NEOCP candidates from the MPC plain-text summary (neocp.txt).
+    Format (whitespace-delimited):
+      DESIG  SCORE  YEAR  MON  DAY.frac  RA(h)  DEC(°)  Vmag
+      STATUS  MON.  DAY  UT  NOBS  ARC(days)  H  SPEED(°/day)
+    Speed is converted to arcsec/min for display (1 °/day = 2.5 ″/min).
+    """
+    rows = []
+    try:
+        text = NEOCP_CACHE.read_text(encoding="ascii", errors="ignore")
+    except Exception as exc:
+        console.print(f"[red]Error loading NEOCP: {exc}[/red]")
+        return pd.DataFrame()
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or not line[0].isalnum():
+            continue
+        tokens = line.split()
+        # Need ≥16 tokens: desig score year mon day ra dec vmag
+        #                  status mon. day UT nobs arc H speed
+        if len(tokens) < 16:
+            continue
+        try:
+            desig            = tokens[0]
+            score            = int(tokens[1])
+            ra_h             = float(tokens[5])   # RA in decimal hours
+            dec_deg          = float(tokens[6])   # Dec in decimal degrees
+            vmag             = float(tokens[7])   # apparent magnitude
+            H                = float(tokens[14])  # absolute magnitude
+            speed_deg_day    = float(tokens[15])  # motion in °/day
+            # 1 °/day = 3600 ″/day / 1440 min/day = 2.5 ″/min
+            speed_arcsec_min = speed_deg_day * 2.5
+            rows.append({
+                "desig":            desig,
+                "name":             desig,
+                "ra_h":             ra_h,
+                "dec_deg":          dec_deg,
+                "V":                vmag,
+                "H":                H,
+                "score":            score,
+                "speed_arcsec_min": speed_arcsec_min,
+            })
+        except (ValueError, IndexError):
+            continue
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    if df.empty:
+        console.print("[yellow]No NEOCP candidates found in file.[/yellow]")
+    else:
+        console.print(f"[dim]{len(df):,} NEOCP candidates loaded.[/dim]")
+    return df
+
+
+# ── NEOScan follow-up priorities (SpaceDyS) ─────────────────────────────────────
+# Priority classes: VERY URGENT > URGENT > NECESSARY
+# Data is an HTML table at NEOSCAN_URL (no JSON endpoint available).
+
+_PRIORITY_ORDER = {
+    "VERY URGENT": 1,   # NEOScan (NEOCP)
+    "URGENT":      2,   # NEODyS PLfile + NEOScan
+    "NECESSARY":   3,   # NEODyS PLfile + NEOScan
+    "USEFUL":      4,   # NEODyS PLfile
+    "LOW":         5,   # NEODyS PLfile
+}
+
+
+def ensure_neoscan():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if NEOSCAN_CACHE.exists():
+        age = datetime.now() - datetime.fromtimestamp(NEOSCAN_CACHE.stat().st_mtime)
+        if age.total_seconds() < NEOCP_CACHE_HOURS * 3600:
+            h, m = divmod(int(age.total_seconds()), 3600)
+            console.print(f"[dim]NEOScan priorities cached ({h}h {m // 60}m ago).[/dim]")
+            return
+    console.print("[cyan]Downloading NEOScan priorities from SpaceDyS...[/cyan]")
+    try:
+        r = requests.get(NEOSCAN_URL, timeout=20)
+        r.raise_for_status()
+        NEOSCAN_CACHE.write_bytes(r.content)
+        console.print(f"[green]Saved: {NEOSCAN_CACHE}[/green]")
+    except Exception as exc:
+        console.print(f"[yellow]NEOScan unavailable ({exc}), priorities will be missing.[/yellow]")
+
+
+class _NSPLParser(HTMLParser):
+    """Extract {designation: priority_class} from the NEOScan HTML priority table."""
+
+    def __init__(self):
+        super().__init__()
+        self.priorities: dict[str, str] = {}
+        self._current_desig: str | None = None
+        self._current_priority: str | None = None
+        self._in_td   = False
+        self._cell_buf = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._current_desig    = None
+            self._current_priority = None
+        elif tag == "td":
+            self._in_td   = True
+            self._cell_buf = ""
+        elif tag == "a":
+            # Object links look like: .../scan_neocp/C45ZWJ1/index_summary_C45ZWJ1.html
+            for name, val in attrs:
+                if name == "href" and val and "scan_neocp" in val:
+                    parts = val.replace("\\", "/").split("/")
+                    try:
+                        idx = parts.index("scan_neocp")
+                        self._current_desig = parts[idx + 1]
+                    except (ValueError, IndexError):
+                        pass
+
+    def handle_data(self, data):
+        if self._in_td:
+            self._cell_buf += data
+
+    def handle_endtag(self, tag):
+        if tag == "td":
+            self._in_td = False
+            text = self._cell_buf.strip()
+            if text in _PRIORITY_ORDER:
+                self._current_priority = text
+            self._cell_buf = ""
+        elif tag == "tr":
+            if self._current_desig and self._current_priority:
+                self.priorities[self._current_desig] = self._current_priority
+            self._current_desig    = None
+            self._current_priority = None
+
+
+def load_neoscan_priorities() -> dict[str, str]:
+    """Return {designation: priority_class} from cached NEOScan HTML. Empty dict on error."""
+    if not NEOSCAN_CACHE.exists():
+        return {}
+    try:
+        html = NEOSCAN_CACHE.read_text(encoding="utf-8", errors="ignore")
+        parser = _NSPLParser()
+        parser.feed(html)
+        return parser.priorities
+    except Exception as exc:
+        console.print(f"[yellow]NEOScan parse error: {exc}[/yellow]")
+        return {}
+
+
+# ── NEODyS follow-up priority list (PLfile.txt) ──────────────────────────────────
+
+_PL_URGENCY_SET = {"URGENT", "NECESSARY", "USEFUL", "LOW"}
+# Provisional designation pattern: 4-digit year (19xx/20xx) + two uppercase letters + optional digits
+# e.g. "2026ET2", "2023DW", "2004LP" — distinguishes from numbered like "2004Lexell"
+_PROV_DESIG_RE  = re.compile(r'^(?:19|20)\d{2}[A-Z]{2}\d*$')
+
+# Map century letter → century prefix (MPC packed designation format)
+_CENTURY_MAP = {"I": "18", "J": "19", "K": "20"}
+
+
+def _unpack_desig(packed: str) -> str:
+    """
+    Convert a packed MPC designation to its standard string form.
+      '00433'   →  '433'        (numbered asteroid)
+      'K26E02T' →  '2026ET2'   (provisional)
+      'K23D00W' →  '2023DW'    (provisional, no subscript)
+    Returns the input unchanged if it cannot be decoded.
+    """
+    s = str(packed).strip()
+    if not s:
+        return s
+
+    # Large numbered asteroid: letter + 4 digits  (A0000 = 100000, etc.)
+    if s[0].isalpha() and s[0].upper() not in _CENTURY_MAP and len(s) == 5 and s[1:].isdigit():
+        base = (ord(s[0].upper()) - ord('A') + 10) * 10000
+        return str(base + int(s[1:]))
+
+    # Plain numbered asteroid: all digits
+    if s.isdigit() or (s[0].isdigit() and s.replace(' ', '').isdigit()):
+        try:
+            return str(int(s))
+        except ValueError:
+            pass
+
+    # Provisional packed: century letter + 2-digit year + half-month + sub1 + sub2 + letter
+    # e.g.  K26E02T → 2026ET2  (century=K→20, year=26, half=E, sub=02→2, letter=T)
+    if len(s) == 7 and s[0] in _CENTURY_MAP:
+        century    = _CENTURY_MAP[s[0]]
+        year       = century + s[1:3]
+        half_month = s[3]
+        sub1, sub2 = s[4], s[5]
+        letter2    = s[6]
+
+        # Decode two-char subscript (digits or A-Z for values ≥ 10)
+        def _decode_char(c: str) -> int:
+            if c.isdigit():
+                return int(c)
+            return ord(c.upper()) - ord('A') + 10
+
+        subscript = _decode_char(sub1) * 10 + _decode_char(sub2)
+        sub_str   = "" if subscript == 0 else str(subscript)
+        return f"{year}{half_month}{letter2}{sub_str}"
+
+    return s
+
+
+def ensure_neodys_pl() -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if NEODYS_PL_CACHE.exists():
+        age = datetime.now() - datetime.fromtimestamp(NEODYS_PL_CACHE.stat().st_mtime)
+        if age.total_seconds() < NEOCP_CACHE_HOURS * 3600:
+            h, m = divmod(int(age.total_seconds()), 3600)
+            console.print(f"[dim]NEODyS priority list cached ({h}h {m // 60}m ago).[/dim]")
+            return
+    console.print("[cyan]Downloading NEODyS priority list (PLfile.txt)...[/cyan]")
+    try:
+        r = requests.get(NEODYS_PL_URL, timeout=20)
+        r.raise_for_status()
+        NEODYS_PL_CACHE.write_bytes(r.content)
+        console.print(f"[green]Saved: {NEODYS_PL_CACHE}[/green]")
+    except Exception as exc:
+        console.print(f"[yellow]NEODyS priority list unavailable ({exc}).[/yellow]")
+
+
+def load_neodys_priorities() -> dict[str, dict]:
+    """
+    Parse PLfile.txt and return:
+      { unpacked_desig: {"urgency": str, "risk": bool, "pha": bool} }
+    Keys use the standard (unpacked) designation, e.g. '2026ET2' or '433'.
+    Format (space-delimited):
+      NAME  URGENCY  PL_VAL  RISK(Yes/No)  PS  H  PHA(Yes/No)  ...
+    """
+    if not NEODYS_PL_CACHE.exists():
+        return {}
+    result: dict[str, dict] = {}
+    try:
+        text = NEODYS_PL_CACHE.read_text(encoding="ascii", errors="ignore")
+    except Exception as exc:
+        console.print(f"[yellow]NEODyS PLfile read error: {exc}[/yellow]")
+        return {}
+
+    for line in text.splitlines():
+        tokens = line.split()
+        # Data lines have urgency as second token
+        if len(tokens) < 7 or tokens[1] not in _PL_URGENCY_SET:
+            continue
+        try:
+            raw_name = tokens[0]
+            urgency  = tokens[1]
+            risk     = tokens[3].lower() == "yes"
+            pha      = tokens[6].lower() == "yes"
+
+            # Distinguish provisional designations from numbered asteroids.
+            # Provisional: 4-digit year (19xx / 20xx) + two UPPERCASE letters + optional digits
+            #   e.g. "2026ET2", "2023DW", "2004LP"  → use as-is
+            # Numbered:  digits optionally followed by a name with mixed/lowercase letters
+            #   e.g. "99942Apophis", "1566Icarus"   → keep only the leading digits
+            if _PROV_DESIG_RE.match(raw_name):
+                key = raw_name          # provisional → keep as-is
+            elif raw_name[0].isdigit():
+                # numbered asteroid — strip name suffix if present
+                num_str = ""
+                for ch in raw_name:
+                    if ch.isdigit():
+                        num_str += ch
+                    else:
+                        break
+                key = num_str if num_str else raw_name
+            else:
+                key = raw_name
+            result[key] = {"urgency": urgency, "risk": risk, "pha": pha}
+        except (ValueError, IndexError):
+            continue
+
+    if result:
+        console.print(f"[dim]NEODyS priorities loaded for {len(result)} objects.[/dim]")
+    return result
 
 
 # ── Parsing MPCORB ───────────────────────────────────────────────────────────────
@@ -207,13 +509,18 @@ def _epochs_to_jd_vectorized(epoch_packed: pd.Series) -> pd.Series:
 
 def _names_vectorized(desig: pd.Series, name_raw: pd.Series) -> pd.Series:
     """Extract readable names with str.extract() — no Python loop."""
-    extracted = (
-        name_raw.astype(str)
-                .str.extract(r'\(\d+\)\s+(.+)', expand=False)
-                .str.strip()
-    )
+    raw = name_raw.astype(str).str.strip()
+
+    # Numbered with name: "(2004) Lexell" → "Lexell"
+    named = raw.str.extract(r'\(\d+\)\s+(.+)', expand=False).str.strip()
+
+    # Provisional: "2026 DR10" (no parentheses) → use as-is
+    prov = raw.where(raw.notna() & (raw != "nan") & (raw != "None") & (~raw.str.startswith("(")))
+
+    # Priority: named > provisional > numeric desig fallback
+    result  = named.where(named.notna() & (named != ""), prov)
     fallback = desig.str.strip().str.lstrip("0").replace("", pd.NA)
-    return extracted.where(extracted.notna() & (extracted != ""), fallback).fillna(desig.str.strip())
+    return result.where(result.notna() & (result != ""), fallback).fillna(desig.str.strip())
 
 
 def load_mpcorb(h_limit: float) -> pd.DataFrame:
@@ -613,6 +920,51 @@ def _positions_at_comets(df: pd.DataFrame, t_jd: float, earth_ecl,
     return result
 
 
+def _positions_at_radec(df: pd.DataFrame, t_astropy: Time,
+                        earth_loc: EarthLocation, window: dict,
+                        mag_limit: float, mag_min: float = 0.0) -> pd.DataFrame:
+    """
+    Compute Az/Alt from snapshot RA/Dec (no orbital propagation).
+    Used for NEOCP candidates where only a positional snapshot is available.
+    Input df must have columns: desig, name, ra_h (RA in decimal hours),
+    dec_deg (Dec in decimal degrees), V, H, score, speed_arcsec_min.
+    Returns the same column structure as _positions_at(); r and delta are NaN.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    ra_deg  = np.array(df["ra_h"].values,    dtype=float) * 15.0
+    dec_deg = np.array(df["dec_deg"].values, dtype=float)
+    vmag    = np.array(df["V"].values,       dtype=float)
+
+    ok_mag = (vmag <= mag_limit) & (vmag >= mag_min)
+    if not np.any(ok_mag):
+        return pd.DataFrame()
+
+    idx    = np.where(ok_mag)[0]
+    coords = SkyCoord(ra=ra_deg[idx] * u.deg, dec=dec_deg[idx] * u.deg, frame="icrs")
+    altaz  = coords.transform_to(AltAz(obstime=t_astropy, location=earth_loc))
+    az     = altaz.az.deg
+    el     = altaz.alt.deg
+
+    ok_win = _in_window(az, el, window)
+    if not np.any(ok_win):
+        return pd.DataFrame()
+
+    final_idx = idx[ok_win]
+    result = df.iloc[final_idx][
+        ["desig", "name", "H", "V", "score", "speed_arcsec_min"]
+    ].copy()
+    result["az"]        = az[ok_win]
+    result["el"]        = el[ok_win]
+    result["ra"]        = ra_deg[idx][ok_win]
+    result["dec"]       = dec_deg[idx][ok_win]
+    result["r"]         = float("nan")
+    result["delta"]     = float("nan")
+    result["body_type"] = "neocp"
+    return result
+
+
 # ── Config & CLI ─────────────────────────────────────────────────────────────────
 
 def load_config(path: Path) -> dict:
@@ -703,9 +1055,10 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation) -> tuple:
     console.print("  Body type:  "
                   "[bold cyan][1][/bold cyan] Asteroids  "
                   "[bold cyan][2][/bold cyan] Comets  "
-                  "[bold cyan][3][/bold cyan] Both")
-    raw_choice = Prompt.ask("  Choice", choices=["1", "2", "3"], default="1")
-    body_type  = {"1": "asteroids", "2": "comets", "3": "both"}[raw_choice]
+                  "[bold cyan][3][/bold cyan] NEOCP  "
+                  "[bold cyan][4][/bold cyan] Both")
+    raw_choice = Prompt.ask("  Choice", choices=["1", "2", "3", "4"], default="1")
+    body_type  = {"1": "asteroids", "2": "comets", "3": "neocp", "4": "both"}[raw_choice]
     console.print()
 
     # ── Date ───────────────────────────────────────────────────────────────────
@@ -811,6 +1164,21 @@ def _tool(mag: float) -> str:
     else:             return "[red]CCD/imaging[/red]"
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────────
+
+def _parse_limit(val: str) -> int:
+    """Argparse type for --limit: accepts a positive integer or 'none'/'0' for no limit."""
+    if val.strip().lower() == "none":
+        return 0
+    try:
+        n = int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid limit value: {val!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError("limit must be ≥ 0")
+    return n
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -821,14 +1189,16 @@ def main():
     parser.add_argument("--refresh", action="store_true", help="Force re-download of catalogues")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip interactive prompts, use config/CLI values")
-    parser.add_argument("--sort", default="mag",
-                        choices=["mag", "vis", "alt", "az", "speed"],
-                        help="Sort by: mag (default), vis, alt, az, speed")
+    parser.add_argument("--sort", default=None,
+                        choices=["mag", "vis", "alt", "az", "speed", "priority"],
+                        help="Sort by: mag, vis, alt, az, speed, priority. "
+                             "If omitted, asked interactively (or defaults to mag with -y).")
     parser.add_argument("--body", default="asteroids",
-                        choices=["asteroids", "comets", "both"],
+                        choices=["asteroids", "comets", "neocp", "both"],
                         help="Body type to search for (used with -y)")
-    parser.add_argument("--limit", type=int, default=None, metavar="N",
-                        help="Show only the top N results (after sorting)")
+    parser.add_argument("--limit", type=_parse_limit, default=100, metavar="N",
+                        help="Show top N results (default: 100). "
+                             "Use --limit 0 or --limit none for no limit.")
     args = parser.parse_args()
 
     # Config
@@ -854,12 +1224,28 @@ def main():
         mag_min   = 0.0
         mag_lim   = obs_cfg.get("magnitude_limit", 11.0)
         body_type = args.body
+        if args.sort is None:
+            args.sort = "mag"
     else:
         epochs_dt, step_min, mag_min, mag_lim, body_type = interactive_setup(cfg, earth_loc)
+        if args.sort is None:
+            console.print(
+                "  Sort by:  "
+                "[bold cyan][1][/bold cyan] Magnitude  "
+                "[bold cyan][2][/bold cyan] Visibility  "
+                "[bold cyan][3][/bold cyan] Altitude  "
+                "[bold cyan][4][/bold cyan] Azimuth  "
+                "[bold cyan][5][/bold cyan] Speed  "
+                "[bold cyan][6][/bold cyan] Priority"
+            )
+            raw_sort  = Prompt.ask("  Choice", choices=["1","2","3","4","5","6"], default="1")
+            args.sort = {"1":"mag","2":"vis","3":"alt","4":"az","5":"speed","6":"priority"}[raw_sort]
+            console.print()
 
     _BODY_LABELS = {
         "asteroids": "Asteroids",
         "comets":    "Comets",
+        "neocp":     "NEOCP candidates",
         "both":      "Asteroids & Comets",
     }
     console.print()
@@ -883,9 +1269,13 @@ def main():
     if args.refresh:
         CACHE_FILE.unlink(missing_ok=True)
         COMET_CACHE.unlink(missing_ok=True)
+        NEOCP_CACHE.unlink(missing_ok=True)
+        NEOSCAN_CACHE.unlink(missing_ok=True)
+        NEODYS_PL_CACHE.unlink(missing_ok=True)
 
-    df_ast = pd.DataFrame()
-    df_com = pd.DataFrame()
+    df_ast   = pd.DataFrame()
+    df_com   = pd.DataFrame()
+    df_neocp = pd.DataFrame()
 
     if body_type in ("asteroids", "both"):
         ensure_mpcorb()
@@ -901,7 +1291,25 @@ def main():
             console.print("[red]No comets in the database for this magnitude limit.[/red]")
             sys.exit(1)
 
-    total_objects = len(df_ast) + len(df_com)
+    if body_type == "neocp":
+        ensure_neocp()
+        ensure_neoscan()
+        df_neocp = load_neocp()
+        if df_neocp.empty:
+            console.print("[red]No NEOCP candidates with usable orbits.[/red]")
+            sys.exit(1)
+
+    neoscan_prio: dict[str, str]  = {}
+    neodys_prio:  dict[str, dict] = {}
+    if body_type == "neocp":
+        neoscan_prio = load_neoscan_priorities()
+        if neoscan_prio:
+            console.print(f"[dim]NEOScan priorities loaded for {len(neoscan_prio)} objects.[/dim]")
+    if body_type in ("asteroids", "both"):
+        ensure_neodys_pl()
+        neodys_prio = load_neodys_priorities()
+
+    total_objects = len(df_ast) + len(df_com) + len(df_neocp)
 
     # Compute positions for each epoch
     best:          dict[str, dict]  = {}
@@ -968,10 +1376,38 @@ def main():
                             velocity[key] = np.degrees(np.arccos(np.clip(cos_sep, -1, 1))) * 3600.0 / dt_min
                     last_pos[key] = (new_ra, new_dec, dt)
 
-    # Add visibility duration and speed to each entry
+            if not df_neocp.empty:
+                vis = _positions_at_radec(df_neocp, t_ast_time,
+                                          earth_loc, sky_window, mag_lim, mag_min)
+                for _, row in vis.iterrows():
+                    key = "N:" + str(row["desig"]).strip()
+                    epoch_counts[key] = epoch_counts.get(key, 0) + 1
+                    if key not in best or row["V"] < best[key]["V"]:
+                        best[key] = {**row.to_dict(), "epoch_dt": dt}
+                    if key not in first_visible:
+                        first_visible[key] = {
+                            "az": float(row["az"]), "el": float(row["el"]),
+                            "epoch_dt": dt,
+                        }
+                    # Speed comes pre-computed from neocp.txt (°/day → ″/min)
+                    spd = float(row.get("speed_arcsec_min") or 0.0)
+                    if spd > 0:
+                        velocity[key] = spd
+
+    # Add visibility duration, speed, and NEODyS priority to each entry
     for key, entry in best.items():
         entry["vis_hours"] = epoch_counts.get(key, 1) * step_min / 60.0
-        entry["speed"] = velocity.get(key)   # arcsec/min, or None if seen only once
+        entry["speed"]     = velocity.get(key)   # arcsec/min, or None if seen only once
+        btype = entry.get("body_type", "asteroid")
+        if btype == "neocp":
+            entry["priority_label"] = neoscan_prio.get(str(entry.get("desig", "")).strip(), "")
+            entry["on_risk_list"]   = False
+        else:
+            unpacked = _unpack_desig(str(entry.get("desig", "")).strip())
+            pl = neodys_prio.get(unpacked, {})
+            entry["priority_label"] = pl.get("urgency", "")
+            entry["on_risk_list"]   = pl.get("risk", False)
+            entry["is_pha"]         = pl.get("pha", False)
 
     if not best:
         console.print(Panel(
@@ -987,25 +1423,30 @@ def main():
 
     # Sorting
     sort_key = {
-        "mag":   lambda r: r["V"],
-        "vis":   lambda r: -r["vis_hours"],              # longest first
-        "alt":   lambda r: -r["el"],                     # highest first
-        "az":    lambda r: r["az"],
-        "speed": lambda r: -(r.get("speed") or 0.0),    # fastest first
+        "mag":      lambda r: r["V"],
+        "vis":      lambda r: -r["vis_hours"],
+        "alt":      lambda r: -r["el"],
+        "az":       lambda r: r["az"],
+        "speed":    lambda r: -(r.get("speed") or 0.0),
+        "priority": lambda r: _PRIORITY_ORDER.get(r.get("priority_label", ""), 9),
     }[args.sort]
     results = sorted(best.values(), key=sort_key)
-    if args.limit and args.limit > 0:
+    if args.limit > 0:          # 0 = no limit (--limit 0 or --limit none)
         results = results[:args.limit]
 
     sort_labels = {"mag": "magnitude", "vis": "visibility duration",
-                   "alt": "altitude",  "az":  "azimuth", "speed": "speed"}
+                   "alt": "altitude",  "az": "azimuth",
+                   "speed": "speed",   "priority": "follow-up priority"}
 
-    n_ast = sum(1 for r in results if r.get("body_type") == "asteroid")
-    n_com = sum(1 for r in results if r.get("body_type") == "comet")
+    n_ast  = sum(1 for r in results if r.get("body_type") == "asteroid")
+    n_com  = sum(1 for r in results if r.get("body_type") == "comet")
+    n_neo  = sum(1 for r in results if r.get("body_type") == "neocp")
     if body_type == "both":
         counts_str = f"{n_ast} asteroid{'s' if n_ast != 1 else ''}, {n_com} comet{'s' if n_com != 1 else ''}"
     elif body_type == "comets":
         counts_str = f"{n_com} comet{'s' if n_com != 1 else ''}"
+    elif body_type == "neocp":
+        counts_str = f"{n_neo} NEOCP candidate{'s' if n_neo != 1 else ''}"
     else:
         counts_str = f"{n_ast} asteroid{'s' if n_ast != 1 else ''}"
 
@@ -1023,6 +1464,14 @@ def main():
     if body_type == "both":
         table.add_column("Type",   justify="center",  width=3)
     table.add_column("Object",     style="bold white", min_width=12)
+    if body_type == "neocp":
+        table.add_column("Score",    justify="center", min_width=6)
+    if body_type == "neocp" and neoscan_prio:
+        table.add_column("Priority", justify="center", min_width=12,
+                         header_style="bold" if args.sort == "priority" else "")
+    if body_type in ("asteroids", "both"):
+        table.add_column("Urgency",  justify="center", min_width=12,
+                         header_style="bold" if args.sort == "priority" else "")
     table.add_column("V mag",      justify="center",   min_width=6)
     table.add_column("H abs",      justify="center",   min_width=6)
     table.add_column("Brightness", justify="center",   min_width=13)
@@ -1042,22 +1491,24 @@ def main():
 
     for i, r in enumerate(results, 1):
         # Readable name — guard against NaN values from pandas
-        desig_str = str(r.get("desig", "")).strip()
+        desig_str    = str(r.get("desig", "")).strip()
+        display_desig = _unpack_desig(desig_str)   # human-readable fallback
         raw_name  = r.get("name", desig_str)
         if raw_name is None or (isinstance(raw_name, float) and np.isnan(raw_name)):
-            name_str = desig_str
+            name_str = display_desig
         else:
-            name_str = str(raw_name).strip() or desig_str
+            name_str = str(raw_name).strip() or display_desig
 
         is_comet = r.get("body_type") == "comet"
-        if is_comet:
+        is_neocp = r.get("body_type") == "neocp"
+        if is_comet or is_neocp:
             display = name_str
         else:
             try:
                 num_i   = int(desig_str)
                 display = f"{name_str} ({num_i})" if name_str != str(num_i) else str(num_i)
             except ValueError:
-                display = name_str or desig_str
+                display = name_str or display_desig
 
         # Visibility duration
         vh = r["vis_hours"]
@@ -1069,7 +1520,12 @@ def main():
             vis_str = f"{h_int}h{m_int:02d}m" if m_int else f"{h_int}h"
 
         # Az/Alt and first-visible time from first_visible dict
-        key = ("C:" if is_comet else "A:") + desig_str
+        if is_neocp:
+            key = "N:" + desig_str
+        elif is_comet:
+            key = "C:" + desig_str
+        else:
+            key = "A:" + desig_str
         fv  = first_visible.get(key, {"az": r.get("az", 0.0),
                                       "el": r.get("el", 0.0),
                                       "epoch_dt": r["epoch_dt"]})
@@ -1082,8 +1538,47 @@ def main():
         spd = r.get("speed")
         spd_str = f"{spd:.1f}" if spd is not None else "—"
 
+        row_cells.append(display)
+        if body_type == "neocp":
+            score_val = r.get("score")
+            row_cells.append(f"{int(score_val)}%" if score_val is not None else "—")
+        if body_type == "neocp" and neoscan_prio:
+            prio = r.get("priority_label", "")
+            prio_str = {
+                "VERY URGENT": "[bold red]VERY URGENT[/bold red]",
+                "URGENT":      "[bold yellow]URGENT[/bold yellow]",
+                "NECESSARY":   "[cyan]NECESSARY[/cyan]",
+            }.get(prio, "[dim]—[/dim]")
+            row_cells.append(prio_str)
+
+        if body_type in ("asteroids", "both") and not is_comet:
+            _URG_STYLE = {
+                "URGENT":    "[bold red]",
+                "NECESSARY": "[bold yellow]",
+                "USEFUL":    "[cyan]",
+                "LOW":       "[dim]",
+            }
+            urg = r.get("priority_label", "")
+            risk_flag = " ⚠" if r.get("on_risk_list") else ""
+            pha_flag  = " ●" if r.get("is_pha") else ""
+            if urg:
+                style_open  = _URG_STYLE.get(urg, "")
+                style_close = style_open.replace("[", "[/") if style_open else ""
+                urg_str = f"{style_open}{urg}{risk_flag}{pha_flag}{style_close}"
+            else:
+                urg_str = "[dim]—[/dim]"
+            row_cells.append(urg_str)
+        elif body_type in ("asteroids", "both") and is_comet:
+            row_cells.append("[dim]—[/dim]")
+
+        r_raw     = r.get("r")
+        delta_raw = r.get("delta")
+        r_str     = ("—" if r_raw is None or (isinstance(r_raw, float) and np.isnan(r_raw))
+                     else f"{float(r_raw):.3f}")
+        delta_str = ("—" if delta_raw is None or (isinstance(delta_raw, float) and np.isnan(delta_raw))
+                     else f"{float(delta_raw):.3f}")
+
         row_cells += [
-            display,
             f"{r['V']:.1f}",
             f"{r['H']:.1f}",
             _magbar(r["V"]),
@@ -1091,8 +1586,8 @@ def main():
             f"{fv_az:.1f}°",
             f"{fv_el:.1f}°",
             _cardinal(fv_az),
-            f"{float(r['r']):.3f}",
-            f"{float(r['delta']):.3f}",
+            r_str,
+            delta_str,
             spd_str,
             fv["epoch_dt"].strftime("%H:%M"),
             _tool(r["V"]),
@@ -1102,11 +1597,20 @@ def main():
     console.print(table)
     console.print()
     console.print(
-        f"[dim]ℹ  Asteroids: elliptic Kepler, H-G (Bowell 1989). "
+        f"[dim]ℹ  Asteroids/NEOCP: elliptic Kepler, H-G (Bowell 1989). "
         f"Comets: m=H+5·logΔ+2.5n·logr. Earth: JPL built-in ephemeris.[/dim]\n"
         f"[dim]💡 Az/Alt and ″/min shown at first-visible epoch. "
         f"Use [bold]--sort speed[/bold] to rank by fastest movers.[/dim]\n"
         f"[dim]🔄 To refresh catalogues: [bold]python minorplanetsfinder.py --refresh[/bold][/dim]\n"
+        + ("[dim]📋 Urgency from NEODyS PLfile.txt (SpaceDyS) — "
+           "[bold red]URGENT[/bold red] > [bold yellow]NECESSARY[/bold yellow] > [cyan]USEFUL[/cyan] > [dim]LOW[/dim]. "
+           "⚠ = on impact risk list. ● = PHA.[/dim]\n"
+           if body_type in ("asteroids", "both") else "")
+        + ("[dim]⚠  NEOCP: positions are snapshot RA/Dec from MPC (neocp.txt) — Az/Alt tracks Earth's rotation "
+           "but RA/Dec does not update. Speed is from the MPC file (°/day → ″/min). "
+           "Priority classes from NEOScan (SpaceDyS): "
+           "[bold red]VERY URGENT[/bold red] > [bold yellow]URGENT[/bold yellow] > [cyan]NECESSARY[/cyan].[/dim]\n"
+           if body_type == "neocp" else "")
     )
 
 
