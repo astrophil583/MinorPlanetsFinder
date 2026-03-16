@@ -1039,11 +1039,12 @@ def _parse_date(s: str) -> date | None:
     return None
 
 
-def interactive_setup(cfg: dict, earth_loc: EarthLocation) -> tuple:
+def interactive_setup(cfg: dict, earth_loc: EarthLocation, args=None) -> tuple:
     """
     Ask user for body type, date, start/end time and magnitude range.
     Returns (epochs_dt, step_min, mag_min, mag_max, body_type).
     body_type: 'asteroids' | 'comets' | 'both'
+    CLI flags (args.body, args.date, args.time) skip the corresponding prompt.
     """
     step_min = int(cfg["observation"].get("step_minutes", 30))
 
@@ -1052,24 +1053,30 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation) -> tuple:
     console.print()
 
     # ── Body type ──────────────────────────────────────────────────────────────
-    console.print("  Body type:  "
-                  "[bold cyan][1][/bold cyan] Asteroids  "
-                  "[bold cyan][2][/bold cyan] Comets  "
-                  "[bold cyan][3][/bold cyan] NEOCP  "
-                  "[bold cyan][4][/bold cyan] Both")
-    raw_choice = Prompt.ask("  Choice", choices=["1", "2", "3", "4"], default="1")
-    body_type  = {"1": "asteroids", "2": "comets", "3": "neocp", "4": "both"}[raw_choice]
-    console.print()
+    if args is not None and args.body is not None:
+        body_type = args.body
+    else:
+        console.print("  Body type:  "
+                      "[bold cyan][1][/bold cyan] Asteroids  "
+                      "[bold cyan][2][/bold cyan] Comets  "
+                      "[bold cyan][3][/bold cyan] NEOCP  "
+                      "[bold cyan][4][/bold cyan] Both")
+        raw_choice = Prompt.ask("  Choice", choices=["1", "2", "3", "4"], default="1")
+        body_type  = {"1": "asteroids", "2": "comets", "3": "neocp", "4": "both"}[raw_choice]
+        console.print()
 
     # ── Date ───────────────────────────────────────────────────────────────────
     today = date.today()
-    raw = Prompt.ask(
-        "  [cyan]Date[/cyan] [dim](dd/mm/yyyy)[/dim]",
-        default=today.strftime("%d/%m/%Y"),
-    )
-    obs_date = _parse_date(raw) or today
-    if obs_date != today:
-        console.print(f"  [dim]→ {obs_date.strftime('%d/%m/%Y')}[/dim]")
+    if args is not None and args.date is not None:
+        obs_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        raw = Prompt.ask(
+            "  [cyan]Date[/cyan] [dim](dd/mm/yyyy)[/dim]",
+            default=today.strftime("%d/%m/%Y"),
+        )
+        obs_date = _parse_date(raw) or today
+        if obs_date != today:
+            console.print(f"  [dim]→ {obs_date.strftime('%d/%m/%Y')}[/dim]")
 
     # ── Compute twilight for defaults ──────────────────────────────────────────
     with console.status("[dim]  Computing astronomical twilight...[/dim]"):
@@ -1088,11 +1095,14 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation) -> tuple:
         default_start, default_end = "20:00", "02:00"
 
     # ── Start time ─────────────────────────────────────────────────────────────
-    raw = Prompt.ask(
-        "  [cyan]Start UTC[/cyan] [dim](HH:MM)[/dim]",
-        default=default_start,
-    )
-    hm = _parse_time(raw) or _parse_time(default_start)
+    if args is not None and args.time is not None:
+        hm = _parse_time(args.time) or _parse_time(default_start)
+    else:
+        raw = Prompt.ask(
+            "  [cyan]Start UTC[/cyan] [dim](HH:MM)[/dim]",
+            default=default_start,
+        )
+        hm = _parse_time(raw) or _parse_time(default_start)
     start_dt = datetime(obs_date.year, obs_date.month, obs_date.day,
                         hm[0], hm[1], tzinfo=timezone.utc)
 
@@ -1193,13 +1203,26 @@ def main():
                         choices=["mag", "vis", "alt", "az", "speed", "priority"],
                         help="Sort by: mag, vis, alt, az, speed, priority. "
                              "If omitted, asked interactively (or defaults to mag with -y).")
-    parser.add_argument("--body", default="asteroids",
+    parser.add_argument("--body", default=None,
                         choices=["asteroids", "comets", "neocp", "both"],
-                        help="Body type to search for (used with -y)")
+                        help="Body type to search for (skips interactive prompt if set)")
     parser.add_argument("--limit", type=_parse_limit, default=100, metavar="N",
                         help="Show top N results (default: 100). "
                              "Use --limit 0 or --limit none for no limit.")
+    parser.add_argument("--format", default="table", choices=["table", "json", "csv"],
+                        help="Output format (default: table). Use json/csv for machine-readable output "
+                             "(implies -y; combine with --quiet for clean stdout piping).")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress progress and status messages. Use with -y. "
+                             "The result table is still shown (use --format json/csv for full silence).")
     args = parser.parse_args()
+
+    # Machine-readable formats imply non-interactive mode
+    if args.format != "table":
+        args.yes = True
+    # Silence Rich console output when quiet or when not printing a table
+    if args.quiet or args.format != "table":
+        console.quiet = True
 
     # Config
     cfg_path = Path(args.config)
@@ -1223,11 +1246,11 @@ def main():
         epochs_dt, step_min = resolve_window(cfg, args.date, args.time)
         mag_min   = 0.0
         mag_lim   = obs_cfg.get("magnitude_limit", 11.0)
-        body_type = args.body
+        body_type = args.body or "asteroids"
         if args.sort is None:
             args.sort = "mag"
     else:
-        epochs_dt, step_min, mag_min, mag_lim, body_type = interactive_setup(cfg, earth_loc)
+        epochs_dt, step_min, mag_min, mag_lim, body_type = interactive_setup(cfg, earth_loc, args)
         if args.sort is None:
             console.print(
                 "  Sort by:  "
@@ -1489,6 +1512,7 @@ def main():
     table.add_column("From (UTC)", justify="center",   min_width=8)
     table.add_column("Instrument", justify="center",   min_width=11)
 
+    json_records: list[dict] = []
     for i, r in enumerate(results, 1):
         # Readable name — guard against NaN values from pandas
         desig_str    = str(r.get("desig", "")).strip()
@@ -1594,24 +1618,75 @@ def main():
         ]
         table.add_row(*row_cells)
 
-    console.print(table)
-    console.print()
-    console.print(
-        f"[dim]ℹ  Asteroids/NEOCP: elliptic Kepler, H-G (Bowell 1989). "
-        f"Comets: m=H+5·logΔ+2.5n·logr. Earth: JPL built-in ephemeris.[/dim]\n"
-        f"[dim]💡 Az/Alt and ″/min shown at first-visible epoch. "
-        f"Use [bold]--sort speed[/bold] to rank by fastest movers.[/dim]\n"
-        f"[dim]🔄 To refresh catalogues: [bold]python minorplanetsfinder.py --refresh[/bold][/dim]\n"
-        + ("[dim]📋 Urgency from NEODyS PLfile.txt (SpaceDyS) — "
-           "[bold red]URGENT[/bold red] > [bold yellow]NECESSARY[/bold yellow] > [cyan]USEFUL[/cyan] > [dim]LOW[/dim]. "
-           "⚠ = on impact risk list. ● = PHA.[/dim]\n"
-           if body_type in ("asteroids", "both") else "")
-        + ("[dim]⚠  NEOCP: positions are snapshot RA/Dec from MPC (neocp.txt) — Az/Alt tracks Earth's rotation "
-           "but RA/Dec does not update. Speed is from the MPC file (°/day → ″/min). "
-           "Priority classes from NEOScan (SpaceDyS): "
-           "[bold red]VERY URGENT[/bold red] > [bold yellow]URGENT[/bold yellow] > [cyan]NECESSARY[/cyan].[/dim]\n"
-           if body_type == "neocp" else "")
-    )
+        # ── JSON/CSV record (always built, only used if --format json/csv) ──────
+        rec: dict = {
+            "rank":              i,
+            "name":              display,
+            "designation":       display_desig,
+            "type":              r.get("body_type", "asteroid"),
+            "v_mag":             round(float(r["V"]), 2),
+            "h_abs":             round(float(r["H"]), 2),
+            "visible_min":       round(float(r["vis_hours"]) * 60),
+            "az_deg":            round(fv_az, 1),
+            "alt_deg":           round(fv_el, 1),
+            "direction":         _cardinal(fv_az),
+            "r_au":              (None if r_raw is None or (isinstance(r_raw, float) and np.isnan(r_raw))
+                                  else round(float(r_raw), 4)),
+            "delta_au":          (None if delta_raw is None or (isinstance(delta_raw, float) and np.isnan(delta_raw))
+                                  else round(float(delta_raw), 4)),
+            "speed_arcsec_min":  (round(float(spd), 2) if spd is not None else None),
+            "from_utc":          fv["epoch_dt"].strftime("%H:%M"),
+        }
+        if body_type in ("asteroids", "both") and not is_comet:
+            rec["urgency"]      = r.get("priority_label") or None
+            rec["on_risk_list"] = bool(r.get("on_risk_list"))
+            rec["is_pha"]       = bool(r.get("is_pha"))
+        if body_type == "neocp" or is_neocp:
+            rec["neocp_score"]       = (int(r["score"]) if r.get("score") is not None else None)
+            rec["neoscan_priority"]  = r.get("priority_label") or None
+        json_records.append(rec)
+
+    # ── Output ───────────────────────────────────────────────────────────────────
+    if args.format == "table":
+        console.quiet = False  # re-enable for result output
+        console.print(table)
+        console.print()
+        console.print(
+            f"[dim]ℹ  Asteroids/NEOCP: elliptic Kepler, H-G (Bowell 1989). "
+            f"Comets: m=H+5·logΔ+2.5n·logr. Earth: JPL built-in ephemeris.[/dim]\n"
+            f"[dim]💡 Az/Alt and ″/min shown at first-visible epoch. "
+            f"Use [bold]--sort speed[/bold] to rank by fastest movers.[/dim]\n"
+            f"[dim]🔄 To refresh catalogues: [bold]python minorplanetsfinder.py --refresh[/bold][/dim]\n"
+            + ("[dim]📋 Urgency from NEODyS PLfile.txt (SpaceDyS) — "
+               "[bold red]URGENT[/bold red] > [bold yellow]NECESSARY[/bold yellow] > [cyan]USEFUL[/cyan] > [dim]LOW[/dim]. "
+               "⚠ = on impact risk list. ● = PHA.[/dim]\n"
+               if body_type in ("asteroids", "both") else "")
+            + ("[dim]⚠  NEOCP: positions are snapshot RA/Dec from MPC (neocp.txt) — Az/Alt tracks Earth's rotation "
+               "but RA/Dec does not update. Speed is from the MPC file (°/day → ″/min). "
+               "Priority classes from NEOScan (SpaceDyS): "
+               "[bold red]VERY URGENT[/bold red] > [bold yellow]URGENT[/bold yellow] > [cyan]NECESSARY[/cyan].[/dim]\n"
+               if body_type == "neocp" else "")
+        )
+
+    elif args.format == "json":
+        import sys as _sys
+        meta = {
+            "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "body_type":     body_type,
+            "sort":          args.sort,
+            "location":      loc_cfg,
+            "sky_window":    sky_window,
+        }
+        _sys.stdout.write(json.dumps({"meta": meta, "results": json_records},
+                                     ensure_ascii=False, indent=2) + "\n")
+
+    elif args.format == "csv":
+        import sys as _sys, csv as _csv
+        if json_records:
+            writer = _csv.DictWriter(_sys.stdout, fieldnames=json_records[0].keys(),
+                                     lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(json_records)
 
 
 if __name__ == "__main__":
