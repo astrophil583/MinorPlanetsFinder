@@ -972,7 +972,8 @@ def load_config(path: Path) -> dict:
         return json.load(f)
 
 
-def resolve_window(cfg: dict, override_date: str | None, override_time: str | None):
+def resolve_window(cfg: dict, override_date: str | None, override_time: str | None,
+                   override_end_time: str | None = None):
     obs = cfg["observation"]
 
     if override_date and override_date != "tonight":
@@ -986,9 +987,20 @@ def resolve_window(cfg: dict, override_date: str | None, override_time: str | No
 
     start_dt = datetime(obs_date.year, obs_date.month, obs_date.day, h, m,
                         tzinfo=timezone.utc)
-    duration  = obs.get("duration_hours", 4)
-    step_min  = int(obs.get("step_minutes", 30))
-    n_steps   = int(duration * 60 / step_min) + 1
+    step_min = int(obs.get("step_minutes", 30))
+
+    if override_end_time:
+        hm_end = _parse_time(override_end_time)
+        if hm_end:
+            end_dt = datetime(obs_date.year, obs_date.month, obs_date.day,
+                              hm_end[0], hm_end[1], tzinfo=timezone.utc)
+            if end_dt <= start_dt:
+                end_dt += timedelta(days=1)
+            n_steps = max(2, int((end_dt - start_dt).total_seconds() / 60 / step_min) + 1)
+        else:
+            n_steps = int(obs.get("duration_hours", 4) * 60 / step_min) + 1
+    else:
+        n_steps = int(obs.get("duration_hours", 4) * 60 / step_min) + 1
 
     epochs_dt = [start_dt + timedelta(minutes=i * step_min) for i in range(n_steps)]
     return epochs_dt, step_min
@@ -1044,9 +1056,10 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation, args=None) -> tuple:
     Ask user for body type, date, start/end time and magnitude range.
     Returns (epochs_dt, step_min, mag_min, mag_max, body_type).
     body_type: 'asteroids' | 'comets' | 'both'
-    CLI flags (args.body, args.date, args.time) skip the corresponding prompt.
+    CLI flags (args.body, args.date, args.time, args.end_time, args.mag) skip the corresponding prompt.
     """
-    step_min = int(cfg["observation"].get("step_minutes", 30))
+    obs_cfg  = cfg["observation"]
+    step_min = int(obs_cfg.get("step_minutes", 30))
 
     console.print()
     console.rule("[bold cyan]Observation setup[/bold cyan]")
@@ -1107,11 +1120,14 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation, args=None) -> tuple:
                         hm[0], hm[1], tzinfo=timezone.utc)
 
     # ── End time ───────────────────────────────────────────────────────────────
-    raw = Prompt.ask(
-        "  [cyan]End UTC[/cyan]   [dim](HH:MM)[/dim]",
-        default=default_end,
-    )
-    hm_end = _parse_time(raw) or _parse_time(default_end)
+    if args is not None and args.end_time is not None:
+        hm_end = _parse_time(args.end_time) or _parse_time(default_end)
+    else:
+        raw = Prompt.ask(
+            "  [cyan]End UTC[/cyan]   [dim](HH:MM)[/dim]",
+            default=default_end,
+        )
+        hm_end = _parse_time(raw) or _parse_time(default_end)
     end_dt  = datetime(obs_date.year, obs_date.month, obs_date.day,
                        hm_end[0], hm_end[1], tzinfo=timezone.utc)
     if end_dt <= start_dt:
@@ -1121,23 +1137,28 @@ def interactive_setup(cfg: dict, earth_loc: EarthLocation, args=None) -> tuple:
     epochs_dt = [start_dt + timedelta(minutes=i * step_min) for i in range(n_steps)]
 
     # ── Magnitude ──────────────────────────────────────────────────────────────
+    default_mag = str(obs_cfg.get("magnitude_limit", 16.0))
     console.print()
-    raw_max = Prompt.ask(
-        "  [cyan]Max magnitude[/cyan] [dim](limit of your setup)[/dim]",
-        default="16.0",
-    )
-    raw_min = Prompt.ask(
-        "  [cyan]Min magnitude[/cyan]  [dim](0 = no lower limit)[/dim]",
-        default="0",
-    )
-    try:
-        mag_max = float(raw_max)
-    except ValueError:
-        mag_max = 16.0
-    try:
-        mag_min = float(raw_min)
-    except ValueError:
+    if args is not None and args.mag is not None:
+        mag_max = args.mag
         mag_min = 0.0
+    else:
+        raw_max = Prompt.ask(
+            "  [cyan]Max magnitude[/cyan] [dim](limit of your setup)[/dim]",
+            default=default_mag,
+        )
+        raw_min = Prompt.ask(
+            "  [cyan]Min magnitude[/cyan]  [dim](0 = no lower limit)[/dim]",
+            default="0",
+        )
+        try:
+            mag_max = float(raw_max)
+        except ValueError:
+            mag_max = float(default_mag)
+        try:
+            mag_min = float(raw_min)
+        except ValueError:
+            mag_min = 0.0
 
     console.print()
     return epochs_dt, step_min, mag_min, mag_max, body_type
@@ -1194,8 +1215,12 @@ def _parse_limit(val: str) -> int:
 def main():
     parser = argparse.ArgumentParser(description="Minor planets visible from your sky window — local computation")
     parser.add_argument("--config",  default="config.json")
-    parser.add_argument("--date",    default=None, help="YYYY-MM-DD")
-    parser.add_argument("--time",    default=None, help="HH or HH:MM UTC")
+    parser.add_argument("--date",     default=None, help="YYYY-MM-DD")
+    parser.add_argument("--time",     default=None, help="Start time HH or HH:MM UTC (skips start-time prompt)")
+    parser.add_argument("--end-time", default=None, dest="end_time",
+                        help="End time HH or HH:MM UTC (skips end-time prompt)")
+    parser.add_argument("--mag",      default=None, type=float,
+                        help="Magnitude limit (overrides config and skips magnitude prompt)")
     parser.add_argument("--refresh", action="store_true", help="Force re-download of catalogues")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip interactive prompts, use config/CLI values")
@@ -1243,9 +1268,9 @@ def main():
 
     # ── Interactive prompts (skippable with -y) ────────────────────────────────
     if args.yes:
-        epochs_dt, step_min = resolve_window(cfg, args.date, args.time)
+        epochs_dt, step_min = resolve_window(cfg, args.date, args.time, args.end_time)
         mag_min   = 0.0
-        mag_lim   = obs_cfg.get("magnitude_limit", 11.0)
+        mag_lim   = args.mag if args.mag is not None else obs_cfg.get("magnitude_limit", 11.0)
         body_type = args.body or "asteroids"
         if args.sort is None:
             args.sort = "mag"
